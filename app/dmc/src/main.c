@@ -33,6 +33,8 @@
 #include <tenstorrent/log_backend_ringbuf.h>
 #include <tenstorrent/tt_smbus_regs.h>
 
+#include "bl_selfcorrect.h"
+
 #define RESET_UNIT_ARC_PC_CORE_0 0x80030C00
 
 #define INITIAL_FAN_SPEED 35
@@ -651,6 +653,18 @@ int main(void)
 	}
 
 	update_fan_speed(false);
+
+	/*
+	 * Make sure MCUBoot matches the new image in blupdate. Runs before the
+	 * ASIC gets SPI flash back, see bl_selfcorrect.c.
+	 */
+	ret = dmc_bl_selfcorrect();
+	if (ret == 1) {
+		LOG_INF("MCUBoot replaced, rebooting into it");
+		sys_reboot(SYS_REBOOT_COLD);
+	} else if (ret < 0) {
+		LOG_ERR("%s() failed: %d", "dmc_bl_selfcorrect", ret);
+	}
 
 	if (bist_rc == 0 && !boot_is_img_confirmed()) {
 		ret = boot_write_img_confirmed();

@@ -262,35 +262,6 @@ partitions {
 
 	/* Leave some space for future fixed partitions, if needed. */
 
-	/*
-	 * Second DMFW update slot, used by the new DMC bootloader (20.0+).
-	 * The legacy bootloader (19.x) uses dmfw/dmfwimg/dmfwtail, which carries the
-	 * dmc-rom-update image in 20.0 bundles so the legacy bootloader can install
-	 * the new bootloader. The new bootloader uses dmfw2/dmfwimg2/dmfwtail2, which
-	 * carries the DM app.
-	 */
-	dmfw2: partition@31e000 {
-		label = "dmfw2";
-		reg = <0x31e000 DT_SIZE_K(452)>;
-		binary-path = "$BUILD_DIR/dmc-slot-padding.bin";
-	};
-
-	dmfwimg2: partition@31f000 {
-		label = "dmfwimg2";
-		reg = <0x31f000 DT_SIZE_K(448)>;
-		binary-path = "$DMFW2_IMAGE_DIR/zephyr/zephyr.signed.bin";
-	};
-
-	/*
-	 * Image trailer for the new DMFW slot. Indicates to MCUBoot that the image
-	 * is valid and should be booted in test mode.
-	 */
-	dmfw2_tail: partition@38e000 {
-		label = "dmfwtl2";
-		reg = <0x38e000 DT_SIZE_K(4)>;
-		binary-path = "$BUILD_DIR/mcuboot_magic_test.bin";
-	};
-
 	/* Free space for storage */
 	storage: partition@d00000 {
 		label = "storage";

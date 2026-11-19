@@ -378,5 +378,5 @@
 #include "tt_blackhole_fixed_partitions.dtsi"
 };
 
-/* Define the DMC firmware partition for MCUBoot */
-slot1_partition: &dmfw2 {};
+/* Define the DMC firmware partition for MCUBoot (DM app slot) */
+slot1_partition: &dmfw {};
