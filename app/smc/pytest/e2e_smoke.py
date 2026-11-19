@@ -7,7 +7,9 @@ import logging
 import os
 import subprocess
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.request import urlretrieve
@@ -2042,4 +2044,277 @@ def test_heartbeat_telemetry(arc_chip_dut, asic_id):
 
     logger.info(
         f"Heartbeat telemetry incrementing correctly: {heartbeat_samples[0]} -> {heartbeat_samples[-1]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# DMC bootloader rotation (19 -> 20). These flash the card, so they are marked
+# bl_rotation and skip unless their BL_ROTATION_* inputs are set. They are not
+# part of the smoke suite.
+# ---------------------------------------------------------------------------
+
+
+def _rotation_input_or_skip(env_name):
+    path = os.environ.get(env_name)
+    if not path:
+        pytest.skip(f"{env_name} not set")
+    if not Path(path).is_file():
+        pytest.fail(f"{env_name} does not exist: {path}")
+    return path
+
+
+def _flash_rotation_bundle(bundle, force=False):
+    cmd = ["tt-flash", "flash", str(bundle)]
+    if force:
+        cmd.append("--force")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    out = strip_ansi_codes(result.stdout + result.stderr)
+    logger.info("tt-flash output:\n%s", out)
+    # tt-flash can exit 0 without flashing (for example, when chip init fails),
+    # so check for its success message as well.
+    assert result.returncode == 0, f"tt-flash exited with {result.returncode}"
+    assert "FLASH SUCCESS" in out, "tt-flash did not report FLASH SUCCESS"
+
+
+def _assert_repo_versions(board_name, asic_id):
+    arc_chip = pyluwen.detect_chips()[asic_id]
+    telemetry = arc_chip.get_telemetry()
+    exp_bundle_version = get_int_version_from_file(TTZP / "VERSION")
+    assert telemetry.fw_bundle_version == exp_bundle_version, (
+        f"Firmware bundle version mismatch: {telemetry.fw_bundle_version:#010x} != {exp_bundle_version:#010x}"
+    )
+    del arc_chip
+    _verify_running_versions(board_name, asic_id)
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_recover_old(board_name, asic_id):
+    """
+    Puts the card on the old-key recovery image, which is the starting point
+    for the rotation. Needs BL_ROTATION_RECOVERY set to that recovery bundle.
+    """
+    bundle = _rotation_input_or_skip("BL_ROTATION_RECOVERY")
+    if board_name is None:
+        pytest.skip("--board is required for recovery")
+    recovery_py = str(TTZP / "scripts/tooling/blackhole_recovery/recover-blackhole.py")
+    result = subprocess.run(
+        [sys.executable, recovery_py, bundle, board_name, "--force", "--no-prompt"],
+        capture_output=True,
+        text=True,
+    )
+    out = strip_ansi_codes(result.stdout + result.stderr)
+    logger.info("recover-blackhole output:\n%s", out)
+    assert result.returncode == 0, f"recover-blackhole exited with {result.returncode}"
+    assert "Card recovered successfully" in out
+    wait_arc_boot(asic_id, timeout=60, min_chips=_expected_chip_count(board_name))
+    arc_chip = pyluwen.detect_chips()[asic_id]
+    arc_chip.get_telemetry()
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_single_flash(board_name, asic_id):
+    """
+    One tt-flash of the 20.0 bundle, without --force, installs the new DMC
+    bootloader and DM app. Needs BL_ROTATION_BUNDLE set to that bundle.
+    """
+    bundle = _rotation_input_or_skip("BL_ROTATION_BUNDLE")
+    _flash_rotation_bundle(bundle)
+    wait_arc_boot(asic_id, timeout=120, min_chips=_expected_chip_count(board_name))
+    _assert_repo_versions(board_name, asic_id)
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_reset_stable(board_name, asic_id):
+    """
+    The 20.0 firmware and DM app stay active across two resets. This is what
+    shows the image is confirmed and not reverted on a later reset.
+    Run after test_bl_rotation_single_flash.
+    """
+    _rotation_input_or_skip("BL_ROTATION_BUNDLE")
+    min_chips = _expected_chip_count(board_name)
+    for reset_no in (1, 2):
+        _reset_smc()
+        wait_arc_boot(asic_id, timeout=120, min_chips=min_chips)
+        logger.info("Checking versions after reset %d", reset_no)
+        _assert_repo_versions(board_name, asic_id)
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_reflash_same_version(board_name, asic_id):
+    """
+    Reflashing the same 20.0 bundle with --force leaves the card on 20.0.
+    """
+    bundle = _rotation_input_or_skip("BL_ROTATION_BUNDLE")
+    _flash_rotation_bundle(bundle, force=True)
+    wait_arc_boot(asic_id, timeout=120, min_chips=_expected_chip_count(board_name))
+    _assert_repo_versions(board_name, asic_id)
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_prod_rom_update_signature():
+    """
+    Host-only, no flash. The rom-update must verify against the shipping 19.x
+    key. Needs BL_ROTATION_PROD_KEY (the key) and BL_ROTATION_PROD_ROM_UPDATE
+    (the signed rom-update image).
+    """
+    key = _rotation_input_or_skip("BL_ROTATION_PROD_KEY")
+    image = _rotation_input_or_skip("BL_ROTATION_PROD_ROM_UPDATE")
+    imgtool = shutil.which("imgtool")
+    if imgtool is None:
+        pytest.skip("imgtool is not on PATH")
+    result = subprocess.run(
+        [imgtool, "verify", "--key", key, image], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+# DMC primary slot (image-0 in tt_blackhole_dmc.dtsi): internal flash
+# 0x08010000 + 448 KiB, so it ends at 0x08080000. MCUboot writes the image
+# trailer at the end of the slot: the 16-byte swap magic is last, and
+# image_ok sits one 8-byte write block before it at 0x0807ffe8.
+DMC_PRIMARY_SLOT_END = 0x08080000
+DMC_IMAGE_OK_ADDR = DMC_PRIMARY_SLOT_END - 0x18
+DMC_TRAILER_DUMP_ADDR = DMC_PRIMARY_SLOT_END - 0x100
+MCUBOOT_FLAG_SET = 0x01
+
+
+def _read_dmc_primary_image_ok():
+    """
+    Read the image_ok byte of the DMC primary slot over SWD. Halts the DMC
+    for the read and resumes it after, without a reset.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "primary_tail.bin"
+        cmd = [
+            str(dmc_reset.DEFAULT_OPENOCD),
+            "-s",
+            str(dmc_reset.DEFAULT_SCRIPTS_DIR),
+            "-f",
+            str(dmc_reset.DEFAULT_DMC_CFG),
+            "-c",
+            (
+                f"init; halt; dump_image {out} {DMC_TRAILER_DUMP_ADDR:#x} 0x100; "
+                "resume; shutdown"
+            ),
+        ]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120, check=False
+        )
+        assert result.returncode == 0, f"openocd exited with {result.returncode}"
+        data = out.read_bytes()
+    return data[DMC_IMAGE_OK_ADDR - DMC_TRAILER_DUMP_ADDR]
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_trailer_after_reset(board_name, asic_id):
+    """
+    T3: after one reset the 20.0 DM app stays active, and the DMC primary
+    slot's image_ok flag is set, so the app is confirmed. Needs
+    BL_ROTATION_BUNDLE set. Run after test_bl_rotation_single_flash.
+    """
+    _rotation_input_or_skip("BL_ROTATION_BUNDLE")
+    _reset_smc()
+    wait_arc_boot(asic_id, timeout=120, min_chips=_expected_chip_count(board_name))
+    _assert_repo_versions(board_name, asic_id)
+    image_ok = _read_dmc_primary_image_ok()
+    logger.info("DMC primary slot image_ok at %#x: %#x", DMC_IMAGE_OK_ADDR, image_ok)
+    assert image_ok == MCUBOOT_FLAG_SET, (
+        f"DM app not confirmed: image_ok is {image_ok:#x}, expected {MCUBOOT_FLAG_SET:#x}"
+    )
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_dmc_reset(board_name, asic_id):
+    """
+    T2, DMC reset part: reset the DMC over SWD with no manual steps. The card
+    must come back by itself, still on 20.0 with the DM app confirmed. The
+    power-cycle step of T2 is not covered here. Needs BL_ROTATION_BUNDLE set.
+    """
+    _rotation_input_or_skip("BL_ROTATION_BUNDLE")
+    smc_test_recovery.reset_dmc()
+    # A DMC reset also resets the SMC, which drops PCIe, so rescan the bus
+    # before looking for the card. 15 s matches the boot and recovery scan.
+    rescan_pcie(remove=False)
+    min_chips = _expected_chip_count(board_name)
+    wait_arc_boot(asic_id, timeout=15, min_chips=min_chips)
+    _assert_repo_versions(board_name, asic_id)
+    image_ok = _read_dmc_primary_image_ok()
+    assert image_ok == MCUBOOT_FLAG_SET, (
+        f"DM app not confirmed after DMC reset: image_ok is {image_ok:#x}"
+    )
+
+
+def _dts_eval_size(expr):
+    expr = re.sub(r"DT_SIZE_M\((\d+)\)", lambda m: str(int(m.group(1)) << 20), expr)
+    expr = re.sub(r"DT_SIZE_K\((\d+)\)", lambda m: str(int(m.group(1)) << 10), expr)
+    return expr
+
+
+def _dts_partition_regions(path):
+    """Return (start, end, label) for each partition@ node that has a reg."""
+    text = Path(path).read_text()
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", "", text)
+    regions = []
+    node_re = re.compile(
+        r"(?:\w+:\s*)?partition@[0-9a-fA-F]+\s*\{(.*?)\};", re.DOTALL
+    )
+    for m in node_re.finditer(text):
+        body = m.group(1)
+        reg = re.search(r"reg\s*=\s*<\s*([^>]+?)\s*>", body)
+        if reg is None:
+            continue
+        label = re.search(r'label\s*=\s*"([^"]+)"', body)
+        start_s, size_s = _dts_eval_size(reg.group(1)).split()[:2]
+        start, size = int(start_s, 0), int(size_s, 0)
+        regions.append((start, start + size, label.group(1) if label else "?"))
+    return regions
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_layout_no_overlap():
+    """
+    T7: host-only. No two SPI partitions partially overlap. Full containment
+    is allowed, since a slot nests its image and trailer (dmfw contains
+    dmfwimg and dmfwtail). Reads the fixed partitions file for this layout.
+    """
+    dtsi = TTZP / "boards/tenstorrent/tt_blackhole/tt_blackhole_fixed_partitions.dtsi"
+    regions = _dts_partition_regions(dtsi)
+    assert regions, f"no partitions found in {dtsi}"
+    bad = []
+    for i, (s1, e1, l1) in enumerate(regions):
+        for s2, e2, l2 in regions[i + 1 :]:
+            overlaps = s1 < e2 and s2 < e1
+            contained = (s1 <= s2 and e2 <= e1) or (s2 <= s1 and e1 <= e2)
+            if overlaps and not contained:
+                bad.append(f"{l1} [{s1:#x},{e1:#x}) and {l2} [{s2:#x},{e2:#x})")
+    assert not bad, "partially overlapping partitions:\n" + "\n".join(bad)
+
+
+@pytest.mark.bl_rotation
+def test_bl_rotation_wrong_key_dm_app(board_name, asic_id):
+    """
+    T5: a bundle whose DM app is signed with the old key must be rejected by
+    the new bootloader. Expected: the card does not come back, and recovery is
+    needed. Destructive. Run last. Needs BL_ROTATION_WRONGKEY_BUNDLE set.
+    """
+    bundle = _rotation_input_or_skip("BL_ROTATION_WRONGKEY_BUNDLE")
+    result = subprocess.run(
+        ["tt-flash", "flash", str(bundle)], capture_output=True, text=True
+    )
+    out = strip_ansi_codes(result.stdout + result.stderr)
+    logger.info("tt-flash output (wrong-key DM app):\n%s", out)
+    _reset_smc()
+    came_back = False
+    deadline = time.time() + 60
+    while time.time() < deadline and not came_back:
+        try:
+            came_back = len(pyluwen.detect_chips()) >= _expected_chip_count(board_name)
+        except Exception:
+            came_back = False
+        if not came_back:
+            time.sleep(1)
+    logger.info("Card came back after wrong-key DM app: %s", came_back)
+    assert not came_back, (
+        "new bootloader booted a DM app signed with the old key; record and recover"
     )

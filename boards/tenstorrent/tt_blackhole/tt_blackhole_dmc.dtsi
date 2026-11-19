@@ -379,4 +379,4 @@
 };
 
 /* Define the DMC firmware partition for MCUBoot */
-slot1_partition: &dmfw {};
+slot1_partition: &dmfw2 {};

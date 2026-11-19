@@ -991,6 +991,20 @@ def _generate_bootfs_yaml(
     """
 
     prod_name = args.board.upper()
+    # Directory of the dmc-rom-update build placed in the bmfw partition. Defaults
+    # to the legacy build so callers that don't pass --rom-update-dir are unchanged.
+    rom_update_dir = getattr(args, "rom_update_dir", None) or os.path.join(
+        args.build_dir, "dmc-rom-update"
+    )
+    # Directory of the build whose signed image is placed in the dmfwimg partition.
+    # Defaults to the DM app build.
+    dmfw_image_dir = getattr(args, "dmfw_image_dir", None) or os.path.join(
+        args.build_dir, "dmc"
+    )
+    # Directory of the DM app placed in the new DMFW slot (dmfwimg2)
+    dmfw2_image_dir = getattr(args, "dmfw2_image_dir", None) or os.path.join(
+        args.build_dir, "dmc"
+    )
 
     partitions_yml = {
         "name": name,
@@ -1028,6 +1042,9 @@ def _generate_bootfs_yaml(
         path = path.replace("$BOARD_REV", gen_name)
         path = path.replace("$BUILD_DIR", str(args.build_dir))
         path = path.replace("$BLOBS_DIR", str(args.blobs_dir))
+        path = path.replace("$ROM_UPDATE_DIR", rom_update_dir)
+        path = path.replace("$DMFW_IMAGE_DIR", dmfw_image_dir)
+        path = path.replace("$DMFW2_IMAGE_DIR", dmfw2_image_dir)
 
         image_entry = {
             "name": label,
@@ -1326,6 +1343,24 @@ def parse_args():
         "--blobs-dir",
         required=True,
         help="Blobs directory containing ethernet and memory firmware binaries.",
+    )
+    generate_bootfs_parser.add_argument(
+        "--dmfw-image-dir",
+        default=None,
+        help="Build directory of the image placed in the dmfwimg partition. "
+        "Defaults to <build-dir>/dmc.",
+    )
+    generate_bootfs_parser.add_argument(
+        "--dmfw2-image-dir",
+        default=None,
+        help="Build directory of the image placed in the dmfwimg2 partition. "
+        "Defaults to <build-dir>/dmc.",
+    )
+    generate_bootfs_parser.add_argument(
+        "--rom-update-dir",
+        default=None,
+        help="Build directory of the dmc-rom-update image placed in the bmfw "
+        "partition. Defaults to <build-dir>/dmc-rom-update.",
     )
     generate_bootfs_parser.add_argument(
         "--verbose", default=0, action="count", help="Log the YAML file."

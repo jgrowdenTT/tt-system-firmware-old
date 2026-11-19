@@ -128,9 +128,24 @@ if(IS_GALAXY_BOARD)
 else()
   # Non-galaxy boards have a DMC
 
+  # dmc-rom-update is built for both DMC bootloader layouts. The legacy build
+  # (18-19) keeps the existing image name and is the one placed in the bundle.
   set(ROM_UPDATE_BIN ${CMAKE_BINARY_DIR}/dmc-rom-update/zephyr/zephyr.signed.bin)
+  set(dmc-rom-update_DTC_OVERLAY_FILE ${APP_DIR}/../dmc_rom_update/overlays/legacy.overlay
+    CACHE INTERNAL "Devicetree overlay for the legacy DMC bootloader")
   ExternalZephyrProject_Add(
     APPLICATION dmc-rom-update
+    SOURCE_DIR  ${APP_DIR}/../dmc_rom_update
+    BOARD       ${SB_CONFIG_DMC_BOARD}
+    BUILD_ONLY 1
+  )
+
+  # The new DMC bootloader (19-20) variant of the same update app.
+  set(ROM_UPDATE_NEW_BIN ${CMAKE_BINARY_DIR}/dmc-rom-update-new/zephyr/zephyr.signed.bin)
+  set(dmc-rom-update-new_DTC_OVERLAY_FILE ${APP_DIR}/../dmc_rom_update/overlays/new.overlay
+    CACHE INTERNAL "Devicetree overlay for the new DMC bootloader")
+  ExternalZephyrProject_Add(
+    APPLICATION dmc-rom-update-new
     SOURCE_DIR  ${APP_DIR}/../dmc_rom_update
     BOARD       ${SB_CONFIG_DMC_BOARD}
     BUILD_ONLY 1
@@ -152,15 +167,50 @@ else()
       "${SB_CONFIG_BOOT_SIGNATURE_KEY_FILE}")
   endif()
 
+  # dmc-rom-update can be signed with its own key, separate from the rest of the
+  # bundle (e.g. the key the installed DMC bootloader trusts during a rotation).
+  # Without an override it uses the main signature key.
+  if(ROM_UPDATE_SIGNATURE_KEY_FILE STREQUAL "")
+    set(rom_update_key "${SB_CONFIG_BOOT_SIGNATURE_KEY_FILE}")
+  else()
+    set(rom_update_key "${ROM_UPDATE_SIGNATURE_KEY_FILE}")
+  endif()
+  if(NOT rom_update_key STREQUAL "")
+    set_config_string(dmc-rom-update CONFIG_MCUBOOT_SIGNATURE_KEY_FILE "${rom_update_key}")
+    set_config_string(dmc-rom-update-new CONFIG_MCUBOOT_SIGNATURE_KEY_FILE "${rom_update_key}")
+  endif()
+
+  # Which dmc-rom-update variant is placed in the bmfw partition: legacy (18-19)
+  # or new (19-20). Must match the DMC bootloader the update will run on.
+  set(ROM_UPDATE_VARIANT "legacy" CACHE STRING "dmc-rom-update variant in bmfw: legacy or new")
+  set_property(CACHE ROM_UPDATE_VARIANT PROPERTY STRINGS legacy new)
+  if(ROM_UPDATE_VARIANT STREQUAL "legacy")
+    set(ROM_UPDATE_DIR ${CMAKE_BINARY_DIR}/dmc-rom-update)
+  elseif(ROM_UPDATE_VARIANT STREQUAL "new")
+    set(ROM_UPDATE_DIR ${CMAKE_BINARY_DIR}/dmc-rom-update-new)
+  else()
+    message(FATAL_ERROR "ROM_UPDATE_VARIANT must be 'legacy' or 'new', got '${ROM_UPDATE_VARIANT}'")
+  endif()
+
   set(BOOTFS_DEPS ${SMC_OUTPUT_BIN} ${RECOVERY_OUTPUT_BIN} ${MCUBOOT_OUTPUT_BIN}
      ${DMC_OUTPUT_BIN} ${ROM_UPDATE_BIN} ${MCUBOOT_BL2_BIN} ${TRAILER_OUTPUT}
-     ${TRAILER_OUTPUT_CONFIRMED} ${DMC_SLOT_BIN})
+     ${TRAILER_OUTPUT_CONFIRMED} ${DMC_SLOT_BIN} ${ROM_UPDATE_NEW_BIN})
 endif()
 
 # ======== Generate filesystem ========
 set(DTS_FILE ${CMAKE_BINARY_DIR}/${DEFAULT_IMAGE}/zephyr/zephyr.dts)
 set(GEN_SCRIPT ${APP_DIR}/../../scripts/tt_boot_fs.py)
 set(OUTPUT_FILE ${CMAKE_BINARY_DIR}/tt_boot_fs.yaml)
+if(NOT DEFINED ROM_UPDATE_DIR)
+  # Boards without a DMC don't build dmc-rom-update; keep the legacy location
+  set(ROM_UPDATE_DIR ${CMAKE_BINARY_DIR}/dmc-rom-update)
+endif()
+
+# DMFW update slots (see tt_blackhole_fixed_partitions.dtsi):
+#   dmfw/dmfwimg   (legacy bootloader slot) <- dmc-rom-update-new
+#   dmfw2/dmfwimg2 (new bootloader slot)    <- DM app
+set(DMFW_IMAGE_DIR ${CMAKE_BINARY_DIR}/dmc-rom-update-new)
+set(DMFW2_IMAGE_DIR ${CMAKE_BINARY_DIR}/dmc)
 
 # Generates boot filesystem YAML from devicetrees
 add_custom_command(
@@ -174,6 +224,9 @@ add_custom_command(
       --output-file ${OUTPUT_FILE}
       --build-dir ${CMAKE_BINARY_DIR}
       --blobs-dir ${APP_DIR}/../../zephyr/blobs
+      --rom-update-dir ${ROM_UPDATE_DIR}
+      --dmfw-image-dir ${DMFW_IMAGE_DIR}
+      --dmfw2-image-dir ${DMFW2_IMAGE_DIR}
     DEPENDS
       ${DTS_FILE}
       ${GEN_SCRIPT}
